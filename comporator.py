@@ -1,5 +1,5 @@
 """
-Comporator — compare multiple named data sources using a declarative rule tree.
+Comporator — compare multiple named SQL-like data sources using a declarative rule tree.
 
 Quick start::
 
@@ -7,12 +7,19 @@ Quick start::
 
     result = Comporator(
         sources=[
-            Source("prod",    {"id": 1, "city": "Kyiv"}, truth=True),
-            Source("staging", {"id": 1, "city": "Lviv"}),
+            Source("prod",    key="id", data=[
+                {"id": 1, "city": "Kyiv"},
+                {"id": 2, "city": "Lviv"},
+                {"id": 3, "city": "Odesa"},   # only in prod
+            ], truth=True),
+            Source("staging", key="id", data=[
+                {"id": 1, "city": "Kyiv"},
+                {"id": 2, "city": "Kharkiv"}, # mismatch
+                {"id": 4, "city": "Dnipro"},  # only in staging
+            ]),
         ],
         schemas=[
-            Equal(Field("id"),   Field("id")),
-            Equal(Field("city"), Field("city"), strict=False),
+            Equal(Field("city", source="prod"), Field("city", source="staging")),
         ],
     ).compare()
 
@@ -22,7 +29,7 @@ Quick start::
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import cached_property
 
@@ -34,6 +41,7 @@ __all__ = [
     "Equal",
     "NotEqual",
     "FieldResult",
+    "UnmatchedRow",
     "ComparisonResult",
     "Status",
 ]
@@ -62,17 +70,19 @@ class Status(Enum):
 
 @dataclass
 class Source:
-    """A named data source.
+    """A named table-like data source.
 
     Args:
-        name:  identifier shown in reports.
-        data:  a dict of field values (one row).
+        name:  identifier shown in reports and referenced by Field.source.
+        key:   the dict field used to join rows across sources.
+        data:  list of row dicts.
         truth: if True, this source is the ground truth;
                mismatches in other sources are reported relative to it.
     """
 
     name: str
-    data: dict
+    key: str
+    data: list[dict]
     truth: bool = False
 
 
@@ -82,39 +92,36 @@ class Source:
 
 
 class Field:
-    """Reference to a single field inside one source dict.
+    """Reference to a single field inside a named source row.
 
     Args:
-        name:  logical field name shown in reports.
-        alias: actual key used to look up the value in the source dict.
-               Falls back to *name* when omitted.
+        name:   logical field name shown in reports.
+        source: name of the :class:`Source` this field belongs to.
+        alias:  actual key used to look up the value in the row dict.
+                Falls back to *name* when omitted.
 
     Example::
 
-        Field("city", alias="city_uid")
-        # displayed as "city" but reads source["city_uid"]
+        Field("city", source="prod", alias="city_uid")
+        # displayed as "city", reads prod_row["city_uid"]
     """
 
-    def __init__(self, name: str, alias: str | None = None) -> None:
+    def __init__(self, name: str, source: str, alias: str | None = None) -> None:
         self.name = name
+        self.source = source
         self.alias = alias
 
     @property
     def key(self) -> str:
-        """The dict key actually used when reading the source."""
+        """The dict key actually used when reading the source row."""
         return self.alias if self.alias is not None else self.name
 
-    @property
-    def _source_count(self) -> int:
-        return 1
-
-    def get(self, source: dict) -> object:
-        return source.get(self.key)
+    def get(self, source_data: dict) -> object:
+        return source_data.get(self.key)
 
     def __repr__(self) -> str:
-        if self.alias is not None:
-            return f"Field({self.name!r}, alias={self.alias!r})"
-        return f"Field({self.name!r})"
+        alias_part = f", alias={self.alias!r}" if self.alias is not None else ""
+        return f"Field({self.name!r}, source={self.source!r}{alias_part})"
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +134,7 @@ class Rule(ABC):
     other nested :class:`Rule` instances.
 
     Args:
-        *children: one child per source (Field or nested Rule).
+        *children: Field or nested Rule nodes.
         strict:    if ``True`` (default) a failed check produces MISMATCH;
                    if ``False`` it produces WARNING instead.
     """
@@ -137,14 +144,6 @@ class Rule(ABC):
         self.strict = strict
 
     # --- tree structure ---
-
-    @cached_property
-    def _source_count(self) -> int:
-        """Total number of sources consumed by this subtree.
-
-        Cached: the tree is immutable after construction.
-        """
-        return sum(c._source_count for c in self.children)
 
     @cached_property
     def _leaf_fields(self) -> list[Field]:
@@ -159,18 +158,14 @@ class Rule(ABC):
 
     # --- value collection ---
 
-    def _collect_values(self, sources: list[dict]) -> list:
-        """Recursively gather leaf values, distributing sources across the tree."""
+    def _collect_values(self, sources: dict[str, dict]) -> list:
+        """Collect leaf values by looking up each Field's named source."""
         values: list = []
-        offset = 0
         for child in self.children:
-            n = child._source_count
-            chunk = sources[offset : offset + n]
             if isinstance(child, Field):
-                values.append(child.get(chunk[0]))
+                values.append(child.get(sources[child.source]))
             else:
-                values.extend(child._collect_values(chunk))
-            offset += n
+                values.extend(child._collect_values(sources))
         return values
 
     # --- evaluation ---
@@ -185,24 +180,20 @@ class Rule(ABC):
 
     def check(
         self,
-        sources: list[dict],
-        source_names: list[str],
+        sources: dict[str, dict],
         truth: str | None = None,
         depth: int = 0,
     ) -> list[FieldResult]:
         """Evaluate this node and all nested rules (DFS).
 
-        Returns a flat list of :class:`FieldResult` — one per rule node,
-        with the current node first followed by its nested children.
-
         Args:
-            sources:      raw data dicts, one per leaf Field in tree order.
-            source_names: display names corresponding to *sources*.
-            truth:        name of the ground-truth source, if any.
-            depth:        recursion depth (used for indentation in reports).
+            sources: mapping of source name → single row dict.
+            truth:   name of the ground-truth source, if any.
+            depth:   recursion depth used for indented report output.
         """
         all_values = self._collect_values(sources)
         fields = self._leaf_fields
+        source_names = [f.source for f in fields]
         status = self._resolve_status(matched=self._matches(all_values))
 
         results = [
@@ -217,19 +208,9 @@ class Rule(ABC):
             )
         ]
 
-        offset = 0
         for child in self.children:
-            n = child._source_count
             if isinstance(child, Rule):
-                results.extend(
-                    child.check(
-                        sources[offset : offset + n],
-                        source_names[offset : offset + n],
-                        truth=truth,
-                        depth=depth + 1,
-                    )
-                )
-            offset += n
+                results.extend(child.check(sources, truth=truth, depth=depth + 1))
 
         return results
 
@@ -264,17 +245,7 @@ class NotEqual(Rule):
 
 @dataclass
 class FieldResult:
-    """Outcome of a single rule node evaluation.
-
-    Attributes:
-        rule:         the rule that produced this result.
-        fields:       leaf Field nodes in DFS order.
-        values:       extracted values corresponding to *fields*.
-        source_names: display names corresponding to *values*.
-        truth:        name of the ground-truth source, or ``None``.
-        status:       MATCH / MISMATCH / WARNING.
-        depth:        nesting depth (0 = top-level rule).
-    """
+    """Outcome of a single rule node evaluation for one matched row."""
 
     rule: Rule
     fields: list[Field]
@@ -298,13 +269,11 @@ class FieldResult:
 
     @property
     def _field_name(self) -> str:
-        """Unique logical field names joined, preserving order."""
         unique = list(dict.fromkeys(f.name for f in self.fields))
         return ", ".join(unique)
 
     @property
     def _sources_str(self) -> str:
-        """'src1, src2 and src3' — Oxford-comma-free English list."""
         if len(self.source_names) <= 1:
             return self.source_names[0] if self.source_names else ""
         return ", ".join(self.source_names[:-1]) + f" and {self.source_names[-1]}"
@@ -312,7 +281,6 @@ class FieldResult:
     def __repr__(self) -> str:
         indent = "  " * self.depth
 
-        # With a ground-truth source, highlight which sources are wrong.
         if self.truth and not self.is_match and self.truth in self.source_names:
             truth_idx = self.source_names.index(self.truth)
             truth_val = self.values[truth_idx]
@@ -326,7 +294,6 @@ class FieldResult:
                 f" [truth ({self.truth})={truth_val!r}, wrong: {', '.join(wrong)}]"
             )
 
-        # Default: show every source with its value.
         details = ", ".join(
             f"{sn}={v!r}" for sn, v in zip(self.source_names, self.values, strict=True)
         )
@@ -338,14 +305,29 @@ class FieldResult:
 
 
 @dataclass
-class ComparisonResult:
-    """Aggregated outcome of a full :class:`Comporator` run.
+class UnmatchedRow:
+    """A row whose key value is present in only one source.
 
     Attributes:
-        results: flat list of :class:`FieldResult`, one per rule node evaluated.
+        source:    name of the source that contains this row.
+        key_value: value of the join key for this row.
+        data:      the full row dict.
     """
 
+    source: str
+    key_value: object
+    data: dict
+
+    def __repr__(self) -> str:
+        return f"  ↳ only in {self.source}: key={self.key_value!r}  {self.data}"
+
+
+@dataclass
+class ComparisonResult:
+    """Aggregated outcome of a full :class:`Comporator` run."""
+
     results: list[FieldResult]
+    unmatched: list[UnmatchedRow] = field(default_factory=list)
 
     @property
     def matches(self) -> int:
@@ -359,14 +341,25 @@ class ComparisonResult:
     def warnings(self) -> int:
         return sum(1 for r in self.results if r.is_warning)
 
+    @property
+    def only_in(self) -> dict[str, int]:
+        """Count of unmatched rows per source."""
+        counts: dict[str, int] = {}
+        for u in self.unmatched:
+            counts[u.source] = counts.get(u.source, 0) + 1
+        return counts
+
     def __str__(self) -> str:
         lines = [
             f"Matches:    {self.matches}",
             f"Mismatches: {self.mismatches}",
             f"Warnings:   {self.warnings}",
+            *[f"Only in {src}: {n}" for src, n in self.only_in.items()],
             "",
             *[repr(r) for r in self.results],
         ]
+        if self.unmatched:
+            lines += ["", *[repr(u) for u in self.unmatched]]
         return "\n".join(lines)
 
 
@@ -376,12 +369,17 @@ class ComparisonResult:
 
 
 class Comporator:
-    """Compare multiple named sources against a schema of rules.
+    """Compare multiple named table sources against a schema of rules.
+
+    Rows are matched across sources by a join key defined on each
+    :class:`Source`.  Rows whose key value is absent in at least one source
+    are collected as :class:`UnmatchedRow` entries.
 
     Args:
         sources: list of :class:`Source` objects; at most one may have
                  ``truth=True``.
-        schemas: list of top-level :class:`Rule` nodes to evaluate.
+        schemas: list of top-level :class:`Rule` nodes applied to every
+                 matched row.
     """
 
     def __init__(self, sources: list[Source], schemas: list[Rule]) -> None:
@@ -389,13 +387,29 @@ class Comporator:
         self.schemas = schemas
 
     def compare(self) -> ComparisonResult:
-        """Run all schemas against all sources and return the aggregated result."""
-        names = [s.name for s in self.sources]
-        rows  = [s.data for s in self.sources]
-        truth_sources = [s.name for s in self.sources if s.truth]
-        truth = truth_sources[0] if truth_sources else None
+        """Join all sources by key, run schemas on matched rows."""
+        truth = next((s.name for s in self.sources if s.truth), None)
 
-        results: list[FieldResult] = []
-        for schema in self.schemas:
-            results.extend(schema.check(rows, names, truth=truth))
-        return ComparisonResult(results=results)
+        # Build per-source index: {key_value: row}
+        indices: dict[str, dict[object, dict]] = {
+            s.name: {row.get(s.key): row for row in s.data} for s in self.sources
+        }
+
+        # Keys present in ALL sources → matched rows
+        common_keys: set = set.intersection(*(set(idx) for idx in indices.values()))
+
+        # Rows whose key is absent from at least one other source → unmatched
+        unmatched: list[UnmatchedRow] = [
+            UnmatchedRow(source=s.name, key_value=kv, data=indices[s.name][kv])
+            for s in self.sources
+            for kv in sorted(set(indices[s.name]) - common_keys, key=str)
+        ]
+
+        # Compare matched rows
+        field_results: list[FieldResult] = []
+        for key_val in sorted(common_keys, key=str):
+            row_by_source = {s.name: indices[s.name][key_val] for s in self.sources}
+            for schema in self.schemas:
+                field_results.extend(schema.check(row_by_source, truth=truth))
+
+        return ComparisonResult(results=field_results, unmatched=unmatched)
