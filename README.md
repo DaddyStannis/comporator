@@ -58,13 +58,18 @@ Every node in the tree generates its own result entry.
 
 ```python
 Equal(
-    Field("id"),                                    # prod
-    Equal(Field("user_id"), Field("uid"), strict=False),  # staging, backup
+    Field("id"),                                              # prod
+    Equal(Field("user_id"), Field("uid"), strict=False),     # staging, backup
 )
 ```
 
+The outer `Equal` collects **all leaf values** from its subtree and checks
+`prod.id == staging.user_id == backup.uid` (strict).  
+The inner `Equal` additionally checks `staging.user_id == backup.uid` on its own,
+with `strict=False`, so a difference there produces a warning rather than a mismatch.
+
 ```
-✗ id = mismatch [truth (prod)=1, wrong: backup=2]
+✗ id, user_id, uid = mismatch [truth (prod)=1, wrong: backup=2]
   ⚠ user_id, uid = warning in staging and backup [staging=1, backup=2]
 ```
 
