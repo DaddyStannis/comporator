@@ -24,6 +24,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
+from functools import cached_property
 
 __all__ = [
     "Comporator",
@@ -137,16 +138,23 @@ class Rule(ABC):
 
     # --- tree structure ---
 
-    @property
+    @cached_property
     def _source_count(self) -> int:
-        """Total number of sources consumed by this subtree."""
+        """Total number of sources consumed by this subtree.
+
+        Cached: the tree is immutable after construction.
+        """
         return sum(c._source_count for c in self.children)
 
+    @cached_property
     def _leaf_fields(self) -> list[Field]:
-        """All leaf Field nodes in DFS left-to-right order."""
+        """All leaf Field nodes in DFS left-to-right order.
+
+        Cached: traverses the full subtree; safe to call repeatedly.
+        """
         result: list[Field] = []
         for c in self.children:
-            result += [c] if isinstance(c, Field) else c._leaf_fields()
+            result += [c] if isinstance(c, Field) else c._leaf_fields
         return result
 
     # --- value collection ---
@@ -194,7 +202,7 @@ class Rule(ABC):
             depth:        recursion depth (used for indentation in reports).
         """
         all_values = self._collect_values(sources)
-        fields = self._leaf_fields()
+        fields = self._leaf_fields
         status = self._resolve_status(matched=self._matches(all_values))
 
         results = [
