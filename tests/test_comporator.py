@@ -5,6 +5,7 @@ from comporator import (
     Equal,
     Field,
     FieldResult,
+    Guard,
     NotEqual,
     Source,
     Status,
@@ -82,6 +83,69 @@ class TestField:
     def test_repr_with_alias(self) -> None:
         r = repr(Field("city", source="prod", alias="CityId"))
         assert r == "Field('city', source='prod', alias='CityId')"
+
+    def test_normalizer_applied_on_get(self) -> None:
+        f = Field("city", source="prod", normalizer=str.lower)
+        assert f.get({"city": "KYIV"}) == "kyiv"
+
+    def test_normalizer_skipped_for_none(self) -> None:
+        f = Field("city", source="prod", normalizer=str.lower)
+        assert f.get({}) is None
+
+    def test_repr_with_normalizer(self) -> None:
+        r = repr(Field("city", source="prod", normalizer=str.lower))
+        assert "normalizer=lower" in r
+
+
+# ---------------------------------------------------------------------------
+# Field normalizer
+# ---------------------------------------------------------------------------
+
+
+def strip_lower(v: object) -> object:
+    return v.strip().lower() if isinstance(v, str) else v  # type: ignore[union-attr]
+
+
+class TestFieldNormalizer:
+    def test_normalizer_applied_transforms_value(self) -> None:
+        f = Field("city", source="prod", normalizer=str.lower)
+        assert f.get({"city": "KYIV"}) == "kyiv"
+
+    def test_normalizer_skipped_for_none(self) -> None:
+        f = Field("city", source="prod", normalizer=str.lower)
+        assert f.get({}) is None
+
+    def test_repr_includes_normalizer_name(self) -> None:
+        r = repr(Field("city", source="prod", normalizer=str.lower))
+        assert "normalizer=lower" in r
+
+    def test_lambda_normalizer_works(self) -> None:
+        norm = lambda v: v.strip()  # noqa: E731
+        f = Field("city", source="prod", normalizer=norm)
+        padded = "  Kyiv  "
+        assert f.get({"city": padded}) == "Kyiv"
+
+    def test_normalizer_makes_mismatch_a_match(self) -> None:
+        sources = {
+            "prod":    {"city": "  Kyiv  "},
+            "staging": {"city": "kyiv"},
+        }
+        result = Equal(
+            Field("city", source="prod",    normalizer=strip_lower),
+            Field("city", source="staging", normalizer=strip_lower),
+        ).check(sources)
+        assert result[0].is_match
+
+    def test_without_normalizer_whitespace_case_is_mismatch(self) -> None:
+        sources = {
+            "prod":    {"city": "  Kyiv  "},
+            "staging": {"city": "kyiv"},
+        }
+        result = Equal(
+            Field("city", source="prod"),
+            Field("city", source="staging"),
+        ).check(sources)
+        assert result[0].is_mismatch
 
 
 # ---------------------------------------------------------------------------
@@ -307,3 +371,65 @@ class TestComporator:
     def test_unmatched_repr_shown_in_str(self) -> None:
         text = str(Comporator(make_sources(), make_schemas()).compare())
         assert "↳ only in" in text
+
+
+# ---------------------------------------------------------------------------
+# Guard
+# ---------------------------------------------------------------------------
+
+GUARD_SOURCES = {
+    "prod":    {"status": "active", "amount": 100},
+    "staging": {"status": "active", "amount": 200},
+}
+
+GUARD_SOURCES_CANCELLED = {
+    "prod":    {"status": "cancelled", "amount": 100},
+    "staging": {"status": "active",    "amount": 200},
+}
+
+
+def make_guard() -> Guard:
+    return Guard(
+        Equal(Field("status", source="prod"), Field("status", source="staging")),
+        Equal(Field("amount", source="prod"), Field("amount", source="staging")),
+    )
+
+
+class TestGuard:
+    def test_guarded_rules_run_when_condition_passes(self) -> None:
+        results = make_guard().check(GUARD_SOURCES)
+        assert not any(r.is_skip for r in results)
+
+    def test_guarded_rules_skipped_when_condition_fails(self) -> None:
+        results = make_guard().check(GUARD_SOURCES_CANCELLED)
+        assert any(r.is_skip for r in results)
+
+    def test_condition_result_always_included(self) -> None:
+        results = make_guard().check(GUARD_SOURCES_CANCELLED)
+        assert results[0].is_mismatch  # condition itself is reported
+
+    def test_skip_count_on_comparison_result(self) -> None:
+        sources = [
+            Source("prod",    key="id", data=[{"id": 1, "status": "cancelled", "amount": 100}]),
+            Source("staging", key="id", data=[{"id": 1, "status": "active",    "amount": 100}]),
+        ]
+        result = Comporator(sources, [make_guard()]).compare()
+        assert result.skipped == 1
+
+    def test_no_skips_when_guard_passes(self) -> None:
+        sources = [
+            Source("prod",    key="id", data=[{"id": 1, "status": "active", "amount": 100}]),
+            Source("staging", key="id", data=[{"id": 1, "status": "active", "amount": 100}]),
+        ]
+        result = Comporator(sources, [make_guard()]).compare()
+        assert result.skipped == 0
+
+    def test_skip_repr_contains_dash_icon(self) -> None:
+        results = make_guard().check(GUARD_SOURCES_CANCELLED)
+        skip_reprs = [repr(r) for r in results if r.is_skip]
+        assert all(r.startswith("–") for r in skip_reprs)
+
+    def test_is_skip_property(self) -> None:
+        results = make_guard().check(GUARD_SOURCES_CANCELLED)
+        skips = [r for r in results if r.is_skip]
+        assert all(r.is_skip and not r.is_match and not r.is_mismatch for r in skips)
