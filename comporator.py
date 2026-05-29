@@ -137,6 +137,16 @@ class Field:
             return self.normalizer(value)
         return value
 
+    # --- operator sugar ---
+
+    def __and__(self, other: Field | Rule) -> Equal:
+        """``f1 & f2``  →  ``Equal(f1, f2)``  (strict equality)"""
+        return Equal(self, other)
+
+    def __or__(self, other: Field | Rule) -> Equal:
+        """``f1 | f2``  →  ``Equal(f1, f2, strict=False)``  (warning on mismatch)"""
+        return Equal(self, other, strict=False)
+
     def __repr__(self) -> str:
         alias_part = f", alias={self.alias!r}" if self.alias is not None else ""
         norm_name = getattr(self.normalizer, "__name__", None) or repr(self.normalizer)
@@ -254,6 +264,28 @@ class Rule(ABC):
                 results.extend(child.check(sources, truth=truth, depth=depth + 1))
 
         return results
+
+    # --- operator sugar ---
+
+    def __and__(self, other: Field | Rule) -> Equal:
+        """``rule & other``  →  ``Equal(rule, other)``  (strict equality)"""
+        return Equal(self, other)
+
+    def __or__(self, other: Field | Rule) -> Equal:
+        """``rule | other``  →  ``Equal(rule, other, strict=False)``  (warning)"""
+        return Equal(self, other, strict=False)
+
+    def __rshift__(self, other: Rule | tuple[Rule, ...]) -> Guard:
+        """``condition >> guarded``  →  ``Guard(condition, *guarded)``
+
+        Parentheses are required due to Python operator precedence
+        (``>>`` binds tighter than ``&`` and ``|``)::
+
+            (f1 & f2) >> (f3 & f4)
+        """
+        if isinstance(other, tuple):
+            return Guard(self, *other)
+        return Guard(self, other)
 
     def __repr__(self) -> str:
         suffix = "" if self.strict else ", strict=False"
