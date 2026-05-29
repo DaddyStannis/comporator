@@ -7,12 +7,12 @@ Quick start::
 
     result = Comporator(
         sources=[
-            Source("prod",    key="id", data=[
+            Source("prod",    join=["id"], data=[
                 {"id": 1, "city": "Kyiv"},
                 {"id": 2, "city": "Lviv"},
                 {"id": 3, "city": "Odesa"},   # only in prod
             ], truth=True),
-            Source("staging", key="id", data=[
+            Source("staging", join=["id"], data=[
                 {"id": 1, "city": "Kyiv"},
                 {"id": 2, "city": "Kharkiv"}, # mismatch
                 {"id": 4, "city": "Dnipro"},  # only in staging
@@ -77,14 +77,21 @@ class Source:
 
     Args:
         name:  identifier shown in reports and referenced by Field.source.
-        key:   the dict field used to join rows across sources.
+        join:  one or more field names used to join rows across sources.
+               A single name joins on a scalar key; multiple names form a
+               composite key (tuple).
         data:  list of row dicts.
         truth: if True, this source is the ground truth;
                mismatches in other sources are reported relative to it.
+
+    Examples::
+
+        Source("orders", join=["id"],              data=[...])          # simple
+        Source("lines",  join=["order_id", "sku"], data=[...])          # composite
     """
 
     name: str
-    key: str
+    join: list[str]
     data: list[dict]
     truth: bool = False
 
@@ -519,12 +526,18 @@ class Comporator:
         self.schemas = schemas
 
     def compare(self) -> ComparisonResult:
-        """Join all sources by key, run schemas on matched rows."""
+        """Join all sources by join key(s), run schemas on matched rows."""
         truth = next((s.name for s in self.sources if s.truth), None)
 
         # Build per-source index: {key_value: row}
+        # Single join field → scalar key; multiple → tuple key.
+        def _row_key(row: dict, join: list[str]) -> object:
+            if len(join) == 1:
+                return row.get(join[0])
+            return tuple(row.get(k) for k in join)
+
         indices: dict[str, dict[object, dict]] = {
-            s.name: {row.get(s.key): row for row in s.data} for s in self.sources
+            s.name: {_row_key(row, s.join): row for row in s.data} for s in self.sources
         }
 
         # Keys present in ALL sources → matched rows

@@ -31,7 +31,7 @@ def make_sources(truth: bool = False) -> list[Source]:
     return [
         Source(
             "prod",
-            key="id",
+            join=["id"],
             data=[
                 {"id": 1, "city": "Kyiv"},
                 {"id": 2, "city": "Lviv"},
@@ -41,7 +41,7 @@ def make_sources(truth: bool = False) -> list[Source]:
         ),
         Source(
             "staging",
-            key="id",
+            join=["id"],
             data=[
                 {"id": 1, "city": "Kyiv"},
                 {"id": 2, "city": "Kharkiv"},
@@ -353,8 +353,8 @@ class TestComporator:
 
     def test_all_rows_match(self) -> None:
         sources = [
-            Source("a", key="id", data=[{"id": 1, "v": 42}, {"id": 2, "v": 7}]),
-            Source("b", key="id", data=[{"id": 1, "v": 42}, {"id": 2, "v": 7}]),
+            Source("a", join=["id"], data=[{"id": 1, "v": 42}, {"id": 2, "v": 7}]),
+            Source("b", join=["id"], data=[{"id": 1, "v": 42}, {"id": 2, "v": 7}]),
         ]
         result = Comporator(
             sources, [Equal(Field("v", source="a"), Field("v", source="b"))]
@@ -371,6 +371,41 @@ class TestComporator:
     def test_unmatched_repr_shown_in_str(self) -> None:
         text = str(Comporator(make_sources(), make_schemas()).compare())
         assert "↳ only in" in text
+
+    def test_composite_join_matches_rows(self) -> None:
+        sources = [
+            Source("a", join=["order_id", "sku"], data=[
+                {"order_id": 1, "sku": "A", "qty": 5},
+                {"order_id": 1, "sku": "B", "qty": 3},
+            ]),
+            Source("b", join=["order_id", "sku"], data=[
+                {"order_id": 1, "sku": "A", "qty": 5},
+                {"order_id": 1, "sku": "B", "qty": 9},  # mismatch
+            ]),
+        ]
+        result = Comporator(
+            sources,
+            [Equal(Field("qty", source="a"), Field("qty", source="b"))],
+        ).compare()
+        assert result.matches == 1
+        assert result.mismatches == 1
+
+    def test_composite_join_unmatched_key_is_tuple(self) -> None:
+        sources = [
+            Source("a", join=["order_id", "sku"], data=[
+                {"order_id": 1, "sku": "A", "qty": 5},
+                {"order_id": 2, "sku": "X", "qty": 1},  # only in a
+            ]),
+            Source("b", join=["order_id", "sku"], data=[
+                {"order_id": 1, "sku": "A", "qty": 5},
+            ]),
+        ]
+        result = Comporator(
+            sources,
+            [Equal(Field("qty", source="a"), Field("qty", source="b"))],
+        ).compare()
+        assert len(result.unmatched) == 1
+        assert result.unmatched[0].key_value == (2, "X")
 
 
 # ---------------------------------------------------------------------------
@@ -410,16 +445,16 @@ class TestGuard:
 
     def test_skip_count_on_comparison_result(self) -> None:
         sources = [
-            Source("prod",    key="id", data=[{"id": 1, "status": "cancelled", "amount": 100}]),
-            Source("staging", key="id", data=[{"id": 1, "status": "active",    "amount": 100}]),
+            Source("prod",    join=["id"], data=[{"id": 1, "status": "cancelled", "amount": 100}]),
+            Source("staging", join=["id"], data=[{"id": 1, "status": "active",    "amount": 100}]),
         ]
         result = Comporator(sources, [make_guard()]).compare()
         assert result.skipped == 1
 
     def test_no_skips_when_guard_passes(self) -> None:
         sources = [
-            Source("prod",    key="id", data=[{"id": 1, "status": "active", "amount": 100}]),
-            Source("staging", key="id", data=[{"id": 1, "status": "active", "amount": 100}]),
+            Source("prod",    join=["id"], data=[{"id": 1, "status": "active", "amount": 100}]),
+            Source("staging", join=["id"], data=[{"id": 1, "status": "active", "amount": 100}]),
         ]
         result = Comporator(sources, [make_guard()]).compare()
         assert result.skipped == 0

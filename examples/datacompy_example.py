@@ -59,8 +59,8 @@ print(compare.report())
 
 result = Comporator(
     sources=[
-        Source("prod", key="id", data=prod_rows, truth=True),
-        Source("staging", key="user_id", data=staging_rows),
+        Source("prod", join=["id"], data=prod_rows, truth=True),
+        Source("staging", join=["user_id"], data=staging_rows),
     ],
     schemas=[
         Equal(Field("client_name", source="prod"), Field("name", source="staging")),
